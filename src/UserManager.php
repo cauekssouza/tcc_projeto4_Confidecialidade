@@ -2,7 +2,7 @@
 
 /*
  * PHP-Auth (https://github.com/delight-im/PHP-Auth)
- * Copyright (c) delight.im (https://www.delight.im/)
+ * Copyright (c) delight.im (https://delight.im/)
  * Licensed under the MIT License (https://opensource.org/licenses/MIT)
  */
 
@@ -31,7 +31,7 @@ abstract class UserManager {
 	/** @var string session field for the email address of the user who is currently signed in (if any) */
 	const SESSION_FIELD_EMAIL = 'auth_email';
 
-	/** @var string session field for the display name (if any) of the user who is currently signed in (if any) */
+	/** @var string session field for the display name (if any) */
 	const SESSION_FIELD_USERNAME = 'auth_username';
 
 	/** @var string session field for the status of the user */
@@ -43,102 +43,100 @@ abstract class UserManager {
 	/** @var string session field for whether the user has been remembered */
 	const SESSION_FIELD_REMEMBERED = 'auth_remembered';
 
-	/** @var string session field for the last database resynchronization */
+	/** @var string timestamp of the session data's last resynchronization */
 	const SESSION_FIELD_LAST_RESYNC = 'auth_last_resync';
 
-	/** @var string session field for the forced logout counter */
+	/** @var string counter that keeps track of forced logouts */
 	const SESSION_FIELD_FORCE_LOGOUT = 'auth_force_logout';
 
-	/** @var string session field for expiration of the first authentication factor */
+	/** @var string timestamp until which first-factor authentication is valid */
 	const SESSION_FIELD_AWAITING_2FA_UNTIL = 'auth_awaiting_2fa_until';
 
-	/** @var string session field for the user awaiting 2FA */
+	/** @var string ID of the user awaiting the second factor */
 	const SESSION_FIELD_AWAITING_2FA_USER_ID = 'auth_awaiting_2fa_user_id';
 
-	/** @var string session field for desired "remember me" duration */
+	/** @var string desired "remember me" duration during 2FA */
 	const SESSION_FIELD_AWAITING_2FA_REMEMBER_DURATION = 'auth_awaiting_2fa_remember_duration';
 
-	/**
-	 * Generic database error message.
-	 *
-	 * Never include database driver messages, SQL statements, table names,
-	 * schema names, credentials or other implementation details here.
-	 */
-	const DATABASE_ERROR_MESSAGE = 'An internal database error occurred';
 
 	/** @var PdoDatabase the database connection to operate on */
 	protected $db;
 
-	/** @var string|null schema name */
+	/** @var string|null schema name for all database tables */
 	protected $dbSchema;
 
-	/** @var string table prefix */
+	/** @var string prefix for the names of all database tables */
 	protected $dbTablePrefix;
 
+
 	/**
-	 * Best-effort removal of a sensitive string from the current scope.
+	 * Best-effort removal of sensitive strings from the current scope.
 	 *
-	 * sodium_memzero is used when available to overwrite the string's
-	 * memory before the variable is released.
+	 * sodium_memzero is used where available because simply calling unset
+	 * or overwriting a PHP variable cannot guarantee that the original
+	 * string buffer has been erased immediately.
 	 *
-	 * PHP does not provide an absolute guarantee that all previous copies
-	 * created internally by the runtime have been overwritten. This method
-	 * nevertheless minimizes the lifetime of plaintext secrets in this scope.
-	 *
-	 * @param string|null $value
+	 * @param mixed $value
 	 * @return void
 	 */
-	private static function clearSensitiveString(&$value) {
-		if (\is_string($value)) {
-			if (
-				$value !== ''
-				&& \function_exists('sodium_memzero')
-			) {
-				\sodium_memzero($value);
-			}
-
+	private static function clearSensitiveValue(&$value) {
+		if (\is_string($value) && \function_exists('sodium_memzero')) {
+			\sodium_memzero($value);
+		}
+		else {
 			$value = null;
 		}
-
-		unset($value);
 	}
 
 	/**
 	 * Creates a random string with the given maximum length.
 	 *
-	 * Uses PHP's CSPRNG through random_bytes.
-	 *
-	 * @param int $maxLength the maximum length of the output string
-	 * @return string the new random string
+	 * @param int $maxLength maximum length of the output string
+	 * @return string new random string
 	 */
 	public static function createRandomString($maxLength = 24) {
 		$bytes = \floor((int) $maxLength / 4) * 3;
 
-		/*
-		 * Preserve valid behavior for the documented input while avoiding
-		 * passing zero to random_bytes.
-		 */
 		if ($bytes <= 0) {
-			return Base64::encodeUrlSafe('');
+			return '';
 		}
 
-		$data = null;
+		/*
+		 * CWE-330:
+		 *
+		 * Prefer PHP's operating-system-backed CSPRNG.
+		 * Keep OpenSSL as a compatibility fallback for older PHP versions.
+		 */
+		if (\function_exists('random_bytes')) {
+			$data = \random_bytes($bytes);
+		}
+		else {
+			$cryptoStrong = false;
+
+			$data = \openssl_random_pseudo_bytes(
+				$bytes,
+				$cryptoStrong
+			);
+
+			/*
+			 * Never silently continue with insufficient randomness.
+			 */
+			if ($data === false || $cryptoStrong !== true) {
+				throw new \RuntimeException(
+					'Cryptographically secure random data could not be generated'
+				);
+			}
+		}
 
 		try {
-			/*
-			 * random_bytes is explicitly intended for cryptographic secrets
-			 * and relies on the operating system's secure random source.
-			 */
-			$data = \random_bytes($bytes);
-
 			return Base64::encodeUrlSafe($data);
 		}
 		finally {
 			/*
-			 * Raw entropy should not remain unnecessarily available in the
-			 * local variable after its Base64 representation has been built.
+			 * Random source material is no longer needed after
+			 * creation of its URL-safe representation.
 			 */
-			self::clearSensitiveString($data);
+			self::clearSensitiveValue($data);
 		}
 	}
 
@@ -147,7 +145,11 @@ abstract class UserManager {
 	 * @param string|null $dbTablePrefix
 	 * @param string|null $dbSchema
 	 */
-	protected function __construct($databaseConnection, $dbTablePrefix = null, $dbSchema = null) {
+	protected function __construct(
+		$databaseConnection,
+		$dbTablePrefix = null,
+		$dbSchema = null
+	) {
 		if ($databaseConnection instanceof PdoDatabase) {
 			$this->db = $databaseConnection;
 		}
@@ -155,7 +157,10 @@ abstract class UserManager {
 			$this->db = PdoDatabase::fromDsn($databaseConnection);
 		}
 		elseif ($databaseConnection instanceof \PDO) {
-			$this->db = PdoDatabase::fromPdo($databaseConnection, true);
+			$this->db = PdoDatabase::fromPdo(
+				$databaseConnection,
+				true
+			);
 		}
 		else {
 			$this->db = null;
@@ -165,7 +170,10 @@ abstract class UserManager {
 			);
 		}
 
-		$this->dbSchema = $dbSchema !== null ? (string) $dbSchema : null;
+		$this->dbSchema = $dbSchema !== null
+			? (string) $dbSchema
+			: null;
+
 		$this->dbTablePrefix = (string) $dbTablePrefix;
 	}
 
@@ -178,6 +186,7 @@ abstract class UserManager {
 	 * @param string|null $username
 	 * @param callable|null $callback
 	 * @return int
+	 *
 	 * @throws InvalidEmailException
 	 * @throws InvalidPasswordException
 	 * @throws UserAlreadyExistsException
@@ -196,50 +205,56 @@ abstract class UserManager {
 		$email = self::validateEmailAddress($email);
 		$password = self::validatePassword($password, true);
 
-		$username = isset($username) ? \trim($username) : null;
+		/*
+		 * PasswordHash::from is intentionally retained.
+		 *
+		 * PHP-Auth uses this abstraction for its password hashing and
+		 * verification strategy, allowing bcrypt/stronger algorithms and
+		 * transparent hash upgrades without breaking compatibility with
+		 * the rest of the library.
+		 *
+		 * The plaintext password is discarded immediately after hashing.
+		 */
+		$passwordHash = null;
+
+		try {
+			$passwordHash = PasswordHash::from($password);
+		}
+		finally {
+			self::clearSensitiveValue($password);
+		}
+
+		$username = isset($username)
+			? \trim($username)
+			: null;
 
 		if ($username === '') {
 			$username = null;
 		}
 
-		if ($requireUniqueUsername) {
-			if ($username !== null) {
-				try {
-					$occurrencesOfUsername = $this->db->selectValue(
-						'SELECT COUNT(*) FROM '
+		if ($requireUniqueUsername && $username !== null) {
+			try {
+				$occurrencesOfUsername = $this->db->selectValue(
+					'SELECT COUNT(*) FROM '
 						. $this->makeTableName('users')
 						. ' WHERE username = ?',
-						[ $username ]
-					);
-				}
-				catch (Error $e) {
-					/*
-					 * CWE-209:
-					 * Never propagate the driver's original diagnostic.
-					 */
-					throw new DatabaseError(self::DATABASE_ERROR_MESSAGE);
-				}
-
-				if ($occurrencesOfUsername > 0) {
-					throw new DuplicateUsernameException();
-				}
+					[ $username ]
+				);
 			}
-		}
+			catch (Error $e) {
+				/*
+				 * CWE-209:
+				 * Never propagate SQL, schema, table, driver or
+				 * connection details from the original exception.
+				 */
+				throw new DatabaseError(
+					'An internal database operation failed'
+				);
+			}
 
-		$passwordHash = null;
-
-		try {
-			/*
-			 * PasswordHash::from uses PHP's password hashing API and keeps
-			 * compatibility with PasswordHash::verify used by PHP-Auth.
-			 */
-			$passwordHash = PasswordHash::from($password);
-		}
-		finally {
-			/*
-			 * The plaintext password is no longer required after hashing.
-			 */
-			self::clearSensitiveString($password);
+			if ($occurrencesOfUsername > 0) {
+				throw new DuplicateUsernameException();
+			}
 		}
 
 		$verified = \is_callable($callback) ? 0 : 1;
@@ -255,34 +270,32 @@ abstract class UserManager {
 					'registered' => \time()
 				]
 			);
+
+			$newUserId = (int) $this->db->getLastInsertId();
 		}
 		catch (IntegrityConstraintViolationException $e) {
-			/*
-			 * Preserve the original public exception contract without
-			 * exposing the underlying integrity constraint.
-			 */
 			throw new UserAlreadyExistsException();
 		}
 		catch (Error $e) {
 			/*
-			 * Do NOT use:
-			 *
-			 *     $e->getMessage()
-			 *
-			 * Database messages may contain schemas, table names,
-			 * column names, SQL fragments or connection information.
+			 * Do not expose:
+			 * - SQL queries
+			 * - table/schema names
+			 * - DB host or credentials
+			 * - driver messages
+			 * - constraint names
 			 */
-			throw new DatabaseError(self::DATABASE_ERROR_MESSAGE);
+			throw new DatabaseError(
+				'An internal database operation failed'
+			);
 		}
 		finally {
 			/*
-			 * The password hash is not plaintext, but minimizing its
-			 * lifetime in local scope provides additional defense in depth.
+			 * Although a password hash is not plaintext, keeping its
+			 * lifetime short reduces unnecessary exposure.
 			 */
-			self::clearSensitiveString($passwordHash);
+			self::clearSensitiveValue($passwordHash);
 		}
-
-		$newUserId = (int) $this->db->getLastInsertId();
 
 		if ($verified === 0) {
 			$this->createConfirmationRequest(
@@ -300,31 +313,36 @@ abstract class UserManager {
 	 *
 	 * @param int $userId
 	 * @param string $newPassword
+	 *
 	 * @throws UnknownIdException
 	 * @throws AuthError
 	 */
-	protected function updatePasswordInternal($userId, $newPassword) {
+	protected function updatePasswordInternal(
+		$userId,
+		$newPassword
+	) {
 		$passwordHash = null;
 
 		try {
-			/*
-			 * Use the library's password hashing abstraction instead of
-			 * storing or transmitting the plaintext password.
-			 */
 			$passwordHash = PasswordHash::from($newPassword);
 		}
 		finally {
 			/*
-			 * Plaintext password is no longer needed.
+			 * Ensure that the local scope no longer references
+			 * the plaintext password after hashing.
 			 */
-			self::clearSensitiveString($newPassword);
+			self::clearSensitiveValue($newPassword);
 		}
 
 		try {
 			$affected = $this->db->update(
 				$this->makeTableNameComponents('users'),
-				[ 'password' => $passwordHash ],
-				[ 'id' => $userId ]
+				[
+					'password' => $passwordHash
+				],
+				[
+					'id' => $userId
+				]
 			);
 
 			if ($affected === 0) {
@@ -332,10 +350,12 @@ abstract class UserManager {
 			}
 		}
 		catch (Error $e) {
-			throw new DatabaseError(self::DATABASE_ERROR_MESSAGE);
+			throw new DatabaseError(
+				'An internal database operation failed'
+			);
 		}
 		finally {
-			self::clearSensitiveString($passwordHash);
+			self::clearSensitiveValue($passwordHash);
 		}
 	}
 
@@ -349,6 +369,7 @@ abstract class UserManager {
 	 * @param int $roles
 	 * @param int $forceLogout
 	 * @param bool $remembered
+	 *
 	 * @throws AuthError
 	 */
 	protected function onLoginSuccessful(
@@ -361,12 +382,10 @@ abstract class UserManager {
 		$remembered
 	) {
 		/*
-		 * CWE-384 — Session Fixation
+		 * CWE-384:
 		 *
-		 * A new session identifier is issued after successful
-		 * authentication, invalidating the previously supplied identifier.
-		 *
-		 * `true` preserves the original behavior of this class.
+		 * Explicitly regenerate the session identifier after successful
+		 * authentication, invalidating the previous session ID.
 		 */
 		Session::regenerate(true);
 
@@ -386,11 +405,12 @@ abstract class UserManager {
 	}
 
 	/**
-	 * Returns requested user data for the account with the username.
+	 * Returns requested user data for the account with the specified username.
 	 *
 	 * @param string $username
 	 * @param array $requestedColumns
 	 * @return array
+	 *
 	 * @throws UnknownUsernameException
 	 * @throws AmbiguousUsernameException
 	 * @throws AuthError
@@ -400,36 +420,37 @@ abstract class UserManager {
 		array $requestedColumns
 	) {
 		try {
+			/*
+			 * IMPORTANT:
+			 * requestedColumns must continue to originate exclusively
+			 * from trusted application/library code.
+			 */
 			$projection = \implode(', ', $requestedColumns);
 
 			$users = $this->db->select(
 				'SELECT '
-				. $projection
-				. ' FROM '
-				. $this->makeTableName('users')
-				. ' WHERE username = ? LIMIT 2 OFFSET 0',
+					. $projection
+					. ' FROM '
+					. $this->makeTableName('users')
+					. ' WHERE username = ? LIMIT 2 OFFSET 0',
 				[ $username ]
 			);
 		}
 		catch (Error $e) {
-			/*
-			 * CWE-209:
-			 * Do not disclose raw SQL/database diagnostic information.
-			 */
-			throw new DatabaseError(self::DATABASE_ERROR_MESSAGE);
+			throw new DatabaseError(
+				'An internal database operation failed'
+			);
 		}
 
 		if (empty($users)) {
 			throw new UnknownUsernameException();
 		}
-		else {
-			if (\count($users) === 1) {
-				return $users[0];
-			}
-			else {
-				throw new AmbiguousUsernameException();
-			}
+
+		if (\count($users) === 1) {
+			return $users[0];
 		}
+
+		throw new AmbiguousUsernameException();
 	}
 
 	/**
@@ -437,6 +458,7 @@ abstract class UserManager {
 	 *
 	 * @param string $email
 	 * @return string
+	 *
 	 * @throws InvalidEmailException
 	 */
 	protected static function validateEmailAddress($email) {
@@ -459,6 +481,7 @@ abstract class UserManager {
 	 * @param string $password
 	 * @param bool|null $isNewPassword
 	 * @return string
+	 *
 	 * @throws InvalidPasswordException
 	 */
 	protected static function validatePassword(
@@ -494,6 +517,7 @@ abstract class UserManager {
 	 * @param int $userId
 	 * @param string $email
 	 * @param callable $callback
+	 *
 	 * @throws AuthError
 	 */
 	protected function createConfirmationRequest(
@@ -502,21 +526,16 @@ abstract class UserManager {
 		callable $callback
 	) {
 		$selector = self::createRandomString(16);
-
-		/*
-		 * Plaintext token exists only because the API contract requires it
-		 * to be supplied to the callback.
-		 */
 		$token = self::createRandomString(16);
-
 		$tokenHashed = null;
 
 		try {
 			/*
-			 * Store only the computationally expensive one-way hash.
+			 * Retain TokenHash::from so token verification remains
+			 * compatible with PHP-Auth's confirmation flow.
 			 *
-			 * TokenHash::from internally uses PHP's password_hash and is
-			 * paired with TokenHash::verify elsewhere in PHP-Auth.
+			 * Only the hash is persisted. The plaintext token exists
+			 * only for the duration required to send it to the user.
 			 */
 			$tokenHashed = TokenHash::from($token);
 
@@ -537,18 +556,15 @@ abstract class UserManager {
 				);
 			}
 			catch (Error $e) {
-				/*
-				 * Never expose DBMS diagnostics, SQL or schema details.
-				 */
 				throw new DatabaseError(
-					self::DATABASE_ERROR_MESSAGE
+					'An internal database operation failed'
 				);
 			}
 
 			if (\is_callable($callback)) {
 				/*
-				 * This is the sole point at which plaintext token exposure
-				 * is necessary due to the original public contract.
+				 * The plaintext token must be available here because
+				 * it is the credential that needs to reach the user.
 				 */
 				$callback($selector, $token);
 			}
@@ -558,11 +574,15 @@ abstract class UserManager {
 		}
 		finally {
 			/*
-			 * Remove secret material as soon as the callback finishes,
-			 * including when the callback throws an exception.
+			 * Minimize lifetime of confirmation credentials after the
+			 * callback has consumed them.
+			 *
+			 * Copies explicitly retained by the callback cannot be
+			 * erased from this scope.
 			 */
-			self::clearSensitiveString($token);
-			self::clearSensitiveString($tokenHashed);
+			self::clearSensitiveValue($token);
+			self::clearSensitiveValue($tokenHashed);
+			self::clearSensitiveValue($selector);
 		}
 	}
 
@@ -571,6 +591,7 @@ abstract class UserManager {
 	 *
 	 * @param int $userId
 	 * @param string $selector
+	 *
 	 * @throws AuthError
 	 */
 	protected function deleteRememberDirectiveForUserById(
@@ -587,19 +608,24 @@ abstract class UserManager {
 
 		try {
 			$this->db->delete(
-				$this->makeTableNameComponents('users_remembered'),
+				$this->makeTableNameComponents(
+					'users_remembered'
+				),
 				$whereMappings
 			);
 		}
 		catch (Error $e) {
-			throw new DatabaseError(self::DATABASE_ERROR_MESSAGE);
+			throw new DatabaseError(
+				'An internal database operation failed'
+			);
 		}
 	}
 
 	/**
-	 * Triggers a forced logout in all sessions belonging to the user.
+	 * Triggers a forced logout in all sessions of the specified user.
 	 *
 	 * @param int $userId
+	 *
 	 * @throws AuthError
 	 */
 	protected function forceLogoutForUserById($userId) {
@@ -614,7 +640,9 @@ abstract class UserManager {
 			);
 		}
 		catch (Error $e) {
-			throw new DatabaseError(self::DATABASE_ERROR_MESSAGE);
+			throw new DatabaseError(
+				'An internal database operation failed'
+			);
 		}
 	}
 
