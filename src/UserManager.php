@@ -1,9 +1,11 @@
 <?php
 
+declare(strict_types=1);
+
 /*
  * PHP-Auth (https://github.com/delight-im/PHP-Auth)
- * Copyright (c) delight.im
- * Licensed under the MIT License
+ * Copyright (c) delight.im (https://delight.im/)
+ * Licensed under the MIT License (https://opensource.org/licenses/MIT)
  */
 
 namespace Delight\Auth;
@@ -14,9 +16,11 @@ use Delight\Db\PdoDatabase;
 use Delight\Db\PdoDsn;
 use Delight\Db\Throwable\Error;
 use Delight\Db\Throwable\IntegrityConstraintViolationException;
+use InvalidArgumentException;
+use PDO;
 
 /**
- * Base abstrata para componentes de gerenciamento de usuários.
+ * Base abstrata para componentes responsáveis pelo gerenciamento de usuários.
  *
  * @internal
  */
@@ -36,121 +40,102 @@ abstract class UserManager
     public const SESSION_FIELD_AWAITING_2FA_REMEMBER_DURATION =
         'auth_awaiting_2fa_remember_duration';
 
-    private const MAX_NEW_PASSWORD_LENGTH = 2048;
-    private const CONFIRMATION_TTL_SECONDS = 86400;
+    private const DEFAULT_RANDOM_STRING_LENGTH = 24;
+    private const CONFIRMATION_TOKEN_LENGTH = 32;
+    private const CONFIRMATION_SELECTOR_LENGTH = 16;
 
-    /** @var PdoDatabase */
-    protected $db;
-
-    /** @var string|null */
-    protected $dbSchema;
-
-    /** @var string */
-    protected $dbTablePrefix;
+    /** 24 horas. */
+    private const CONFIRMATION_TTL = 86_400;
 
     /**
-     * Cria uma string aleatória segura codificada em Base64 URL-safe.
-     *
-     * O tamanho deve ser múltiplo de 4 porque três bytes resultam
-     * em quatro caracteres Base64.
-     *
-     * @param int $maxLength
-     * @return string
+     * Limite alto o suficiente para passphrases, mas evita entradas gigantes
+     * usadas para consumir CPU/memória durante o hashing.
      */
-    public static function createRandomString($maxLength = 24)
-    {
-        $maxLength = (int) $maxLength;
+    private const MAX_PASSWORD_LENGTH = 2048;
 
-        if ($maxLength < 4 || $maxLength % 4 !== 0) {
-            throw new \InvalidArgumentException(
-                'Random string length must be a positive multiple of 4'
-            );
-        }
+    protected PdoDatabase $db;
 
-        $bytes = intdiv($maxLength, 4) * 3;
+    protected ?string $dbSchema;
 
-        return Base64::encodeUrlSafe(\random_bytes($bytes));
-    }
+    protected string $dbTablePrefix;
 
     /**
-     * @param PdoDatabase|PdoDsn|\PDO $databaseConnection
-     * @param string|null $dbTablePrefix
-     * @param string|null $dbSchema
+     * @param PdoDatabase|PdoDsn|PDO $databaseConnection
      */
     protected function __construct(
         $databaseConnection,
-        $dbTablePrefix = null,
-        $dbSchema = null
+        ?string $dbTablePrefix = null,
+        ?string $dbSchema = null
     ) {
         $this->db = self::createDatabaseConnection($databaseConnection);
-        $this->dbSchema = $dbSchema !== null ? (string) $dbSchema : null;
-        $this->dbTablePrefix = $dbTablePrefix !== null
-            ? (string) $dbTablePrefix
-            : '';
+        $this->dbSchema = $dbSchema;
+        $this->dbTablePrefix = $dbTablePrefix ?? '';
     }
 
     /**
-     * @param PdoDatabase|PdoDsn|\PDO $databaseConnection
-     * @return PdoDatabase
+     * Cria uma string aleatória adequada para tokens e seletores.
+     *
+     * O valor retornado usa Base64 URL-safe.
+     *
+     * @throws InvalidArgumentException
      */
-    private static function createDatabaseConnection($databaseConnection)
-    {
-        if ($databaseConnection instanceof PdoDatabase) {
-            return $databaseConnection;
+    public static function createRandomString(
+        int $maxLength = self::DEFAULT_RANDOM_STRING_LENGTH
+    ): string {
+        if ($maxLength < 4 || $maxLength % 4 !== 0) {
+            throw new InvalidArgumentException(
+                'O tamanho deve ser um múltiplo de 4 e maior ou igual a 4'
+            );
         }
 
-        if ($databaseConnection instanceof PdoDsn) {
-            return PdoDatabase::fromDsn($databaseConnection);
-        }
+        /*
+         * Base64 converte aproximadamente 3 bytes em 4 caracteres.
+         *
+         * random_bytes() deve ser preferido a openssl_random_pseudo_bytes()
+         * para geração de segredos e tokens.
+         */
+        $bytes = intdiv($maxLength, 4) * 3;
 
-        if ($databaseConnection instanceof \PDO) {
-            return PdoDatabase::fromPdo($databaseConnection, true);
-        }
-
-        throw new \InvalidArgumentException(
-            'The database connection must be an instance of '
-            . '`PdoDatabase`, `PdoDsn` or `PDO`'
-        );
+        return Base64::encodeUrlSafe(random_bytes($bytes));
     }
 
     /**
      * Cria um novo usuário.
      *
-     * @param bool $requireUniqueUsername
-     * @param string $email
-     * @param string $password
-     * @param string|null $username
-     * @param callable|null $callback
-     * @return int
+     * @throws InvalidEmailException
+     * @throws InvalidPasswordException
+     * @throws UserAlreadyExistsException
+     * @throws DuplicateUsernameException
+     * @throws AuthError
      */
     protected function createUserInternal(
-        $requireUniqueUsername,
-        $email,
-        $password,
-        $username = null,
-        callable $callback = null
-    ) {
-        \ignore_user_abort(true);
+        bool $requireUniqueUsername,
+        string $email,
+        string $password,
+        ?string $username = null,
+        ?callable $callback = null
+    ): int {
+        ignore_user_abort(true);
 
         $email = self::validateEmailAddress($email);
         $password = self::validatePassword($password, true);
         $username = self::normalizeUsername($username);
 
-        if ($requireUniqueUsername && $username !== null) {
-            $this->assertUsernameAvailable($username);
+        if (
+            $requireUniqueUsername
+            && $username !== null
+            && $this->usernameExists($username)
+        ) {
+            throw new DuplicateUsernameException();
         }
 
         /*
-         * A senha em texto puro deixa de ser necessária imediatamente
-         * depois deste ponto.
+         * A senha em texto puro nunca deve ser armazenada.
+         *
+         * Assume-se que PasswordHash::from() utilize password_hash()
+         * ou algoritmo equivalente seguro.
          */
         $passwordHash = PasswordHash::from($password);
-
-        /*
-         * Não reutilizamos a variável $password para o hash.
-         * Isso evita confusão entre segredo em texto puro e hash.
-         */
-        unset($password);
 
         $verified = $callback === null ? 1 : 0;
 
@@ -162,27 +147,22 @@ abstract class UserManager
                     'password' => $passwordHash,
                     'username' => $username,
                     'verified' => $verified,
-                    'registered' => \time(),
+                    'registered' => time(),
                 ]
             );
-        }
-        catch (IntegrityConstraintViolationException $e) {
+        } catch (IntegrityConstraintViolationException $e) {
             /*
-             * Não repassamos detalhes da exceção SQL para o chamador.
+             * A garantia definitiva contra duplicação deve estar no banco
+             * através de uma UNIQUE CONSTRAINT sobre o e-mail.
              */
             throw new UserAlreadyExistsException();
-        }
-        catch (Error $e) {
-            throw $this->databaseError($e);
+        } catch (Error $e) {
+            throw self::createDatabaseError($e);
         }
 
         $userId = (int) $this->db->getLastInsertId();
 
-        if (!$verified) {
-            /*
-             * Nesse fluxo callback obrigatoriamente existe, pois
-             * $verified só é 0 quando callback != null.
-             */
+        if ($verified === 0) {
             $this->createConfirmationRequest(
                 $userId,
                 $email,
@@ -194,75 +174,32 @@ abstract class UserManager
     }
 
     /**
-     * @param mixed $username
-     * @return string|null
-     */
-    private static function normalizeUsername($username)
-    {
-        if ($username === null) {
-            return null;
-        }
-
-        $username = \trim((string) $username);
-
-        return $username === '' ? null : $username;
-    }
-
-    /**
-     * Verifica rapidamente se já existe um username.
+     * Atualiza a senha de um usuário.
      *
-     * SELECT 1 ... LIMIT 1 evita contar todos os registros.
-     *
-     * @param string $username
-     * @return void
+     * @throws InvalidPasswordException
+     * @throws UnknownIdException
+     * @throws AuthError
      */
-    private function assertUsernameAvailable($username)
-    {
-        try {
-            $exists = $this->db->selectValue(
-                'SELECT 1'
-                . ' FROM ' . $this->makeTableName('users')
-                . ' WHERE username = ?'
-                . ' LIMIT 1',
-                [$username]
-            );
-        }
-        catch (Error $e) {
-            throw $this->databaseError($e);
-        }
-
-        if ($exists !== false && $exists !== null) {
-            throw new DuplicateUsernameException();
-        }
-    }
-
-    /**
-     * Atualiza a senha do usuário.
-     *
-     * @param int $userId
-     * @param string $newPassword
-     * @return void
-     */
-    protected function updatePasswordInternal($userId, $newPassword)
-    {
+    protected function updatePasswordInternal(
+        int $userId,
+        string $newPassword
+    ): void {
         /*
-         * O método original fazia o hash sem executar a mesma validação
-         * aplicada na criação do usuário.
+         * Valide ANTES de executar hashing.
+         *
+         * Isso também limita entradas excessivamente grandes.
          */
         $newPassword = self::validatePassword($newPassword, true);
         $passwordHash = PasswordHash::from($newPassword);
-
-        unset($newPassword);
 
         try {
             $affected = $this->db->update(
                 $this->makeTableNameComponents('users'),
                 ['password' => $passwordHash],
-                ['id' => (int) $userId]
+                ['id' => $userId]
             );
-        }
-        catch (Error $e) {
-            throw $this->databaseError($e);
+        } catch (Error $e) {
+            throw self::createDatabaseError($e);
         }
 
         if ($affected === 0) {
@@ -271,51 +208,38 @@ abstract class UserManager
     }
 
     /**
-     * Chamado após autenticação bem-sucedida.
-     *
-     * @param int $userId
-     * @param string $email
-     * @param string|null $username
-     * @param int $status
-     * @param int $roles
-     * @param int $forceLogout
-     * @param bool $remembered
-     * @return void
+     * Executado após uma autenticação bem-sucedida.
      */
     protected function onLoginSuccessful(
-        $userId,
-        $email,
-        $username,
-        $status,
-        $roles,
-        $forceLogout,
-        $remembered
-    ) {
+        int $userId,
+        string $email,
+        ?string $username,
+        int $status,
+        int $roles,
+        int $forceLogout,
+        bool $remembered
+    ): void {
         /*
-         * Essencial contra session fixation.
+         * Mitiga session fixation.
+         *
+         * O ID antigo é invalidado e um novo ID é associado à sessão
+         * autenticada.
          */
         Session::regenerate(true);
 
         $_SESSION[self::SESSION_FIELD_LOGGED_IN] = true;
-        $_SESSION[self::SESSION_FIELD_USER_ID] = (int) $userId;
-        $_SESSION[self::SESSION_FIELD_EMAIL] = (string) $email;
+        $_SESSION[self::SESSION_FIELD_USER_ID] = $userId;
+        $_SESSION[self::SESSION_FIELD_EMAIL] = $email;
         $_SESSION[self::SESSION_FIELD_USERNAME] = $username;
-        $_SESSION[self::SESSION_FIELD_STATUS] = (int) $status;
-        $_SESSION[self::SESSION_FIELD_ROLES] = (int) $roles;
-        $_SESSION[self::SESSION_FIELD_FORCE_LOGOUT] = (int) $forceLogout;
-        $_SESSION[self::SESSION_FIELD_REMEMBERED] = (bool) $remembered;
-        $_SESSION[self::SESSION_FIELD_LAST_RESYNC] = \time();
+        $_SESSION[self::SESSION_FIELD_STATUS] = $status;
+        $_SESSION[self::SESSION_FIELD_ROLES] = $roles;
+        $_SESSION[self::SESSION_FIELD_FORCE_LOGOUT] = $forceLogout;
+        $_SESSION[self::SESSION_FIELD_REMEMBERED] = $remembered;
+        $_SESSION[self::SESSION_FIELD_LAST_RESYNC] = time();
 
-        $this->clearPendingTwoFactorSession();
-    }
-
-    /**
-     * Remove dados temporários relacionados ao primeiro fator do 2FA.
-     *
-     * @return void
-     */
-    private function clearPendingTwoFactorSession()
-    {
+        /*
+         * Remove qualquer estado temporário de autenticação em dois fatores.
+         */
         $_SESSION[self::SESSION_FIELD_AWAITING_2FA_UNTIL] = null;
         $_SESSION[self::SESSION_FIELD_AWAITING_2FA_USER_ID] = null;
         $_SESSION[
@@ -324,36 +248,38 @@ abstract class UserManager
     }
 
     /**
-     * Busca dados de usuário pelo username.
+     * Retorna dados de usuário a partir do username.
      *
-     * Os parâmetros de valores são enviados separadamente ao banco.
-     * Os nomes das colunas, entretanto, fazem parte da própria consulta,
-     * portanto precisam ser validados explicitamente.
-     *
-     * @param string $username
-     * @param array $requestedColumns
-     * @return array
+     * @throws UnknownUsernameException
+     * @throws AmbiguousUsernameException
+     * @throws AuthError
      */
     protected function getUserDataByUsername(
-        $username,
+        string $username,
         array $requestedColumns
-    ) {
-        $projection = self::buildSafeProjection($requestedColumns);
+    ): array {
+        $projection = self::buildSafeColumnProjection($requestedColumns);
 
         try {
+            /*
+             * LIMIT 2 é proposital.
+             *
+             * Não precisamos buscar todos os registros para descobrir se
+             * há ambiguidade. Dois registros já são suficientes.
+             */
             $users = $this->db->select(
-                'SELECT ' . $projection
-                . ' FROM ' . $this->makeTableName('users')
-                . ' WHERE username = ?'
-                . ' LIMIT 2',
+                sprintf(
+                    'SELECT %s FROM %s WHERE username = ? LIMIT 2',
+                    $projection,
+                    $this->makeTableName('users')
+                ),
                 [$username]
             );
-        }
-        catch (Error $e) {
-            throw $this->databaseError($e);
+        } catch (Error $e) {
+            throw self::createDatabaseError($e);
         }
 
-        $count = \count($users);
+        $count = count($users);
 
         if ($count === 0) {
             throw new UnknownUsernameException();
@@ -367,49 +293,17 @@ abstract class UserManager
     }
 
     /**
-     * @param array $columns
-     * @return string
+     * Valida e normaliza um endereço de e-mail.
+     *
+     * @throws InvalidEmailException
      */
-    private static function buildSafeProjection(array $columns)
+    protected static function validateEmailAddress(string $email): string
     {
-        if ($columns === []) {
-            throw new \InvalidArgumentException(
-                'At least one column must be requested'
-            );
-        }
-
-        foreach ($columns as $column) {
-            if (
-                !\is_string($column)
-                || !\preg_match(
-                    '/\A[a-zA-Z_][a-zA-Z0-9_]*\z/D',
-                    $column
-                )
-            ) {
-                throw new \InvalidArgumentException(
-                    'Invalid database column name'
-                );
-            }
-        }
-
-        return \implode(', ', $columns);
-    }
-
-    /**
-     * @param string $email
-     * @return string
-     */
-    protected static function validateEmailAddress($email)
-    {
-        if (!\is_string($email)) {
-            throw new InvalidEmailException();
-        }
-
-        $email = \trim($email);
+        $email = trim($email);
 
         if (
             $email === ''
-            || \filter_var($email, \FILTER_VALIDATE_EMAIL) === false
+            || filter_var($email, FILTER_VALIDATE_EMAIL) === false
         ) {
             throw new InvalidEmailException();
         }
@@ -418,26 +312,27 @@ abstract class UserManager
     }
 
     /**
-     * Valida uma senha sem modificar o conteúdo informado pelo usuário.
+     * Valida uma senha.
      *
      * IMPORTANTE:
-     * não aplicar trim(), strtolower(), normalização arbitrária etc.
+     * Não usamos trim() em senhas.
      *
-     * @param string $password
-     * @param bool|null $isNewPassword
-     * @return string
+     * Espaços podem fazer parte legitimamente da senha e modificá-los
+     * silenciosamente reduz a entropia e pode impedir autenticações futuras.
+     *
+     * @throws InvalidPasswordException
      */
     protected static function validatePassword(
-        $password,
-        $isNewPassword = null
-    ) {
-        if (!\is_string($password) || $password === '') {
+        string $password,
+        ?bool $isNewPassword = null
+    ): string {
+        if ($password === '') {
             throw new InvalidPasswordException();
         }
 
         if (
-            (bool) $isNewPassword
-            && \strlen($password) > self::MAX_NEW_PASSWORD_LENGTH
+            $isNewPassword === true
+            && strlen($password) > self::MAX_PASSWORD_LENGTH
         ) {
             throw new InvalidPasswordException();
         }
@@ -446,81 +341,67 @@ abstract class UserManager
     }
 
     /**
-     * Cria pedido de confirmação de endereço de e-mail.
-     *
-     * O token bruto é entregue ao usuário, enquanto apenas seu hash
-     * é persistido no banco.
-     *
-     * @param int $userId
-     * @param string $email
-     * @param callable $callback
-     * @return void
+     * Cria uma solicitação de confirmação de e-mail.
      */
     protected function createConfirmationRequest(
-        $userId,
-        $email,
+        int $userId,
+        string $email,
         callable $callback
-    ) {
+    ): void {
         /*
-         * Selector pode ser armazenado em claro porque serve para localizar
-         * rapidamente o registro. O segredo real é o token.
-         *
-         * Mantemos 16 caracteres para compatibilidade com esquemas existentes.
+         * Selector não precisa ser secreto, mas ainda deve ser imprevisível
+         * para evitar enumeração e colisões.
          */
-        $selector = self::createRandomString(16);
+        $selector = self::createRandomString(
+            self::CONFIRMATION_SELECTOR_LENGTH
+        );
 
         /*
-         * Mais entropia para o segredo. Como apenas o HASH é persistido,
-         * aumentar o token normalmente não exige aumentar a coluna token.
+         * O token é o segredo.
          *
-         * Caso o protocolo existente exija exatamente 16 caracteres,
-         * mantenha o valor anterior.
+         * Somente seu hash será persistido no banco.
          */
-        $token = self::createRandomString(32);
+        $token = self::createRandomString(
+            self::CONFIRMATION_TOKEN_LENGTH
+        );
+
         $tokenHash = TokenHash::from($token);
-
-        $expires = \time() + self::CONFIRMATION_TTL_SECONDS;
 
         try {
             $this->db->insert(
                 $this->makeTableNameComponents('users_confirmations'),
                 [
-                    'user_id' => (int) $userId,
-                    'email' => (string) $email,
+                    'user_id' => $userId,
+                    'email' => $email,
                     'selector' => $selector,
                     'token' => $tokenHash,
-                    'expires' => $expires,
+                    'expires' => time() + self::CONFIRMATION_TTL,
                 ]
             );
-        }
-        catch (Error $e) {
-            throw $this->databaseError($e);
+        } catch (Error $e) {
+            throw self::createDatabaseError($e);
         }
 
         /*
-         * O token em claro só existe durante esta requisição.
-         * Nunca deve ser gravado em banco, log ou sistema de analytics.
+         * Apenas o token original enviado ao usuário pode validar a
+         * solicitação. O banco contém somente o hash.
          */
         $callback($selector, $token);
-
-        unset($token);
     }
 
     /**
-     * @param int $userId
-     * @param string|null $selector
-     * @return void
+     * Exclui uma diretiva "remember me".
      */
     protected function deleteRememberDirectiveForUserById(
-        $userId,
-        $selector = null
-    ) {
+        int $userId,
+        ?string $selector = null
+    ): void {
         $where = [
-            'user' => (int) $userId,
+            'user' => $userId,
         ];
 
         if ($selector !== null) {
-            $where['selector'] = (string) $selector;
+            $where['selector'] = $selector;
         }
 
         try {
@@ -528,86 +409,176 @@ abstract class UserManager
                 $this->makeTableNameComponents('users_remembered'),
                 $where
             );
-        }
-        catch (Error $e) {
-            throw $this->databaseError($e);
+        } catch (Error $e) {
+            throw self::createDatabaseError($e);
         }
     }
 
     /**
-     * Força logout de todas as sessões do usuário.
-     *
-     * @param int $userId
-     * @return void
+     * Força logout em todas as sessões pertencentes ao usuário.
      */
-    protected function forceLogoutForUserById($userId)
+    protected function forceLogoutForUserById(int $userId): void
     {
-        $userId = (int) $userId;
-
-        $this->deleteRememberDirectiveForUserById($userId);
-
         try {
+            /*
+             * Remove tokens persistentes antes de invalidar sessões.
+             */
+            $this->deleteRememberDirectiveForUserById($userId);
+
             $this->db->exec(
-                'UPDATE ' . $this->makeTableName('users')
-                . ' SET force_logout = force_logout + 1'
-                . ' WHERE id = ?',
+                sprintf(
+                    'UPDATE %s
+                     SET force_logout = force_logout + 1
+                     WHERE id = ?',
+                    $this->makeTableName('users')
+                ),
                 [$userId]
             );
-        }
-        catch (Error $e) {
-            throw $this->databaseError($e);
+        } catch (DatabaseError $e) {
+            throw $e;
+        } catch (Error $e) {
+            throw self::createDatabaseError($e);
         }
     }
 
     /**
-     * @param string $name
+     * Monta os componentes de um nome de tabela.
+     *
      * @return string[]
      */
-    protected function makeTableNameComponents($name)
+    protected function makeTableNameComponents(string $name): array
     {
-        $components = [];
-
-        if ($this->dbSchema !== null && $this->dbSchema !== '') {
-            $components[] = $this->dbSchema;
+        if ($name === '') {
+            return [];
         }
 
-        if ($name === null || $name === '') {
-            return $components;
+        $tableName = $this->dbTablePrefix . $name;
+
+        if ($this->dbSchema === null || $this->dbSchema === '') {
+            return [$tableName];
         }
 
-        $components[] = $this->dbTablePrefix . $name;
-
-        return $components;
+        return [
+            $this->dbSchema,
+            $tableName,
+        ];
     }
 
     /**
-     * @param string $name
-     * @return string
+     * Retorna o nome completo de uma tabela.
      */
-    protected function makeTableName($name)
+    protected function makeTableName(string $name): string
     {
-        return \implode(
+        return implode(
             '.',
             $this->makeTableNameComponents($name)
         );
     }
 
     /**
-     * Evita que detalhes internos do banco sejam propagados
-     * inadvertidamente para camadas superiores.
+     * Converte as diferentes formas suportadas de conexão para PdoDatabase.
      *
-     * O erro original deve ser enviado ao sistema de logs na camada
-     * de infraestrutura, não apresentado ao usuário.
-     *
-     * @param Error $error
-     * @return DatabaseError
+     * @param PdoDatabase|PdoDsn|PDO $databaseConnection
      */
-    private function databaseError(Error $error)
+    private static function createDatabaseConnection(
+        $databaseConnection
+    ): PdoDatabase {
+        if ($databaseConnection instanceof PdoDatabase) {
+            return $databaseConnection;
+        }
+
+        if ($databaseConnection instanceof PdoDsn) {
+            return PdoDatabase::fromDsn($databaseConnection);
+        }
+
+        if ($databaseConnection instanceof PDO) {
+            return PdoDatabase::fromPdo($databaseConnection, true);
+        }
+
+        throw new InvalidArgumentException(
+            'A conexão deve ser uma instância de PdoDatabase, PdoDsn ou PDO'
+        );
+    }
+
+    /**
+     * Normaliza o username sem transformar string vazia em um nome válido.
+     */
+    private static function normalizeUsername(?string $username): ?string
+    {
+        if ($username === null) {
+            return null;
+        }
+
+        $username = trim($username);
+
+        return $username === '' ? null : $username;
+    }
+
+    /**
+     * Verifica se já existe um usuário com o username.
+     */
+    private function usernameExists(string $username): bool
+    {
+        try {
+            $count = $this->db->selectValue(
+                sprintf(
+                    'SELECT COUNT(*)
+                     FROM %s
+                     WHERE username = ?',
+                    $this->makeTableName('users')
+                ),
+                [$username]
+            );
+        } catch (Error $e) {
+            throw self::createDatabaseError($e);
+        }
+
+        return (int) $count > 0;
+    }
+
+    /**
+     * Cria com segurança a lista de colunas da cláusula SELECT.
+     *
+     * Valores usados na projeção SQL não podem ser parametrizados através
+     * de placeholders. Portanto, cada identificador precisa ser validado.
+     */
+    private static function buildSafeColumnProjection(
+        array $columns
+    ): string {
+        if ($columns === []) {
+            throw new InvalidArgumentException(
+                'Ao menos uma coluna deve ser solicitada'
+            );
+        }
+
+        foreach ($columns as $column) {
+            if (
+                !is_string($column)
+                || preg_match(
+                    '/^[A-Za-z_][A-Za-z0-9_]*$/D',
+                    $column
+                ) !== 1
+            ) {
+                throw new InvalidArgumentException(
+                    'Nome de coluna SQL inválido'
+                );
+            }
+        }
+
+        return implode(', ', $columns);
+    }
+
+    /**
+     * Converte erros da camada de banco na exceção pública da biblioteca.
+     *
+     * Evita repetir esse código em todos os métodos.
+     */
+    private static function createDatabaseError(Error $error): DatabaseError
     {
         /*
-         * Não usamos $error->getMessage() aqui, pois a mensagem pode
-         * conter nomes de tabelas, constraints, SQL ou outros detalhes.
+         * Não inclua parâmetros SQL, senha, token, cookie ou outros segredos
+         * na mensagem lançada ou em logs.
          */
-        return new DatabaseError('Database operation failed');
+        return new DatabaseError($error->getMessage());
     }
 }
