@@ -1,4 +1,3 @@
-```php
 <?php
 
 /*
@@ -25,84 +24,59 @@ abstract class UserManager {
 
 	/** @var string session field for whether the client is currently signed in */
 	const SESSION_FIELD_LOGGED_IN = 'auth_logged_in';
-
 	/** @var string session field for the ID of the user who is currently signed in (if any) */
 	const SESSION_FIELD_USER_ID = 'auth_user_id';
-
 	/** @var string session field for the email address of the user who is currently signed in (if any) */
 	const SESSION_FIELD_EMAIL = 'auth_email';
-
 	/** @var string session field for the display name (if any) of the user who is currently signed in (if any) */
 	const SESSION_FIELD_USERNAME = 'auth_username';
-
-	/** @var string session field for the status of the user who is currently signed in (if any) */
+	/** @var string session field for the status of the user who is currently signed in (if any) as one of the constants from the {@see Status} class */
 	const SESSION_FIELD_STATUS = 'auth_status';
-
-	/** @var string session field for the roles of the user who is currently signed in (if any) */
+	/** @var string session field for the roles of the user who is currently signed in (if any) as a bitmask using constants from the {@see Role} class */
 	const SESSION_FIELD_ROLES = 'auth_roles';
-
-	/** @var string session field for whether the user has been remembered */
+	/** @var string session field for whether the user who is currently signed in (if any) has been remembered (instead of them having authenticated actively) */
 	const SESSION_FIELD_REMEMBERED = 'auth_remembered';
-
-	/** @var string session field for last synchronization timestamp */
+	/** @var string session field for the UNIX timestamp in seconds of the session data's last resynchronization with its authoritative source in the database */
 	const SESSION_FIELD_LAST_RESYNC = 'auth_last_resync';
-
-	/** @var string session field for forced logout counter */
+	/** @var string session field for the counter that keeps track of forced logouts that need to be performed in the current session */
 	const SESSION_FIELD_FORCE_LOGOUT = 'auth_force_logout';
-
-	/** @var string session field for 2FA first-factor expiration */
+	/** @var string session field for the UNIX timestamp in seconds until which the first factor of authentication is considered to be completed and valid */
 	const SESSION_FIELD_AWAITING_2FA_UNTIL = 'auth_awaiting_2fa_until';
-
-	/** @var string session field for 2FA user ID */
+	/** @var string session field for the ID of the user for whom the first factor of authentication has already been completed */
 	const SESSION_FIELD_AWAITING_2FA_USER_ID = 'auth_awaiting_2fa_user_id';
-
-	/** @var string session field for 2FA remember duration */
+	/** @var string session field for the desired "remember me" duration that the user originally requested when attempting to sign in */
 	const SESSION_FIELD_AWAITING_2FA_REMEMBER_DURATION = 'auth_awaiting_2fa_remember_duration';
 
-	/** @var PdoDatabase */
+	/** @var PdoDatabase the database connection to operate on */
 	protected $db;
-
-	/** @var string|null */
+	/** @var string|null the schema name for all database tables used by this component */
 	protected $dbSchema;
-
-	/** @var string */
+	/** @var string the prefix for the names of all database tables used by this component */
 	protected $dbTablePrefix;
 
 	/**
 	 * Creates a random string with the given maximum length
 	 *
-	 * Uses a cryptographically-secure random number generator.
+	 * With the default parameter, the output should contain at least as much randomness as a UUID
 	 *
-	 * @param int $maxLength
-	 * @return string
+	 * @param int $maxLength the maximum length of the output string (integer multiple of 4)
+	 * @return string the new random string
 	 */
 	public static function createRandomString($maxLength = 24) {
+		// calculate how many bytes of randomness we need for the specified string length
 		$bytes = \floor((int) $maxLength / 4) * 3;
 
-		/*
-		 * CWE-330:
-		 * random_bytes uses the operating system's cryptographically-secure
-		 * random number generator and fails closed by throwing an exception
-		 * if secure randomness cannot be obtained.
-		 */
-		$data = \random_bytes($bytes);
+		// get random data
+		$data = \openssl_random_pseudo_bytes($bytes);
 
-		try {
-			return Base64::encodeUrlSafe($data);
-		}
-		finally {
-			/*
-			 * PHP does not guarantee secure zeroization of immutable strings,
-			 * but removing references reduces their lifetime in the current scope.
-			 */
-			unset($data);
-		}
+		// return the Base64-encoded result
+		return Base64::encodeUrlSafe($data);
 	}
 
 	/**
-	 * @param PdoDatabase|PdoDsn|\PDO $databaseConnection
-	 * @param string|null $dbTablePrefix
-	 * @param string|null $dbSchema
+	 * @param PdoDatabase|PdoDsn|\PDO $databaseConnection the database connection to operate on
+	 * @param string|null $dbTablePrefix (optional) the prefix for the names of all database tables used by this component
+	 * @param string|null $dbSchema (optional) the schema name for all database tables used by this component
 	 */
 	protected function __construct($databaseConnection, $dbTablePrefix = null, $dbSchema = null) {
 		if ($databaseConnection instanceof PdoDatabase) {
@@ -117,9 +91,7 @@ abstract class UserManager {
 		else {
 			$this->db = null;
 
-			throw new \InvalidArgumentException(
-				'The database connection must be an instance of either `PdoDatabase`, `PdoDsn` or `PDO`'
-			);
+			throw new \InvalidArgumentException('The database connection must be an instance of either `PdoDatabase`, `PdoDsn` or `PDO`');
 		}
 
 		$this->dbSchema = $dbSchema !== null ? (string) $dbSchema : null;
@@ -129,25 +101,34 @@ abstract class UserManager {
 	/**
 	 * Creates a new user
 	 *
-	 * @param bool $requireUniqueUsername
-	 * @param string $email
-	 * @param string $password
-	 * @param string|null $username
-	 * @param callable|null $callback
-	 * @return int
-	 * @throws InvalidEmailException
-	 * @throws InvalidPasswordException
-	 * @throws UserAlreadyExistsException
-	 * @throws DuplicateUsernameException
-	 * @throws AuthError
+	 * If you want the user's account to be activated by default, pass `null` as the callback
+	 *
+	 * If you want to make the user verify their email address first, pass an anonymous function as the callback
+	 *
+	 * The callback function must have the following signature:
+	 *
+	 * `function ($selector, $token)`
+	 *
+	 * Both pieces of information must be sent to the user, usually embedded in a link
+	 *
+	 * When the user wants to verify their email address as a next step, both pieces will be required again
+	 *
+	 * @param bool $requireUniqueUsername whether it must be ensured that the username is unique
+	 * @param string $email the email address to register
+	 * @param string $password the password for the new account
+	 * @param string|null $username (optional) the username that will be displayed
+	 * @param callable|null $callback (optional) the function that sends the confirmation email to the user
+	 * @return int the ID of the user that has been created (if any)
+	 * @throws InvalidEmailException if the email address has been invalid
+	 * @throws InvalidPasswordException if the password has been invalid
+	 * @throws UserAlreadyExistsException if a user with the specified email address already exists
+	 * @throws DuplicateUsernameException if it was specified that the username must be unique while it was *not*
+	 * @throws AuthError if an internal problem occurred (do *not* catch)
+	 *
+	 * @see confirmEmail
+	 * @see confirmEmailAndSignIn
 	 */
-	protected function createUserInternal(
-		$requireUniqueUsername,
-		$email,
-		$password,
-		$username = null,
-		callable $callback = null
-	) {
+	protected function createUserInternal($requireUniqueUsername, $email, $password, $username = null, callable $callback = null) {
 		\ignore_user_abort(true);
 
 		$email = self::validateEmailAddress($email);
@@ -155,41 +136,31 @@ abstract class UserManager {
 
 		$username = isset($username) ? \trim($username) : null;
 
+		// if the supplied username is the empty string or has consisted of whitespace only
 		if ($username === '') {
+			// this actually means that there is no username
 			$username = null;
 		}
 
-		if ($requireUniqueUsername && $username !== null) {
-			try {
+		// if the uniqueness of the username is to be ensured
+		if ($requireUniqueUsername) {
+			// if a username has actually been provided
+			if ($username !== null) {
+				// count the number of users who do already have that specified username
 				$occurrencesOfUsername = $this->db->selectValue(
 					'SELECT COUNT(*) FROM ' . $this->makeTableName('users') . ' WHERE username = ?',
 					[ $username ]
 				);
-			}
-			catch (Error $e) {
-				/*
-				 * CWE-209:
-				 * Never propagate database driver messages, SQL statements,
-				 * schema names, table names or connection information.
-				 */
-				throw new DatabaseError();
-			}
 
-			if ($occurrencesOfUsername > 0) {
-				throw new DuplicateUsernameException();
+				// if any user with that username does already exist
+				if ($occurrencesOfUsername > 0) {
+					// cancel the operation and report the violation of this requirement
+					throw new DuplicateUsernameException();
+				}
 			}
 		}
 
-		/*
-		 * PasswordHash::from must internally use a strong password-specific
-		 * algorithm such as Argon2id or bcrypt.
-		 *
-		 * The plaintext value is replaced immediately after hashing so the
-		 * original secret is no longer referenced by this local variable.
-		 */
-		$passwordHash = PasswordHash::from($password);
-		unset($password);
-
+		$password = PasswordHash::from($password);
 		$verified = \is_callable($callback) ? 0 : 1;
 
 		try {
@@ -197,25 +168,19 @@ abstract class UserManager {
 				$this->makeTableNameComponents('users'),
 				[
 					'email' => $email,
-					'password' => $passwordHash,
+					'password' => $password,
 					'username' => $username,
 					'verified' => $verified,
 					'registered' => \time()
 				]
 			);
 		}
+		// if we have a duplicate entry
 		catch (IntegrityConstraintViolationException $e) {
 			throw new UserAlreadyExistsException();
 		}
 		catch (Error $e) {
-			/*
-			 * CWE-209:
-			 * Deliberately discard the original DB error message.
-			 */
-			throw new DatabaseError();
-		}
-		finally {
-			unset($passwordHash);
+			throw new DatabaseError($e->getMessage());
 		}
 
 		$newUserId = (int) $this->db->getLastInsertId();
@@ -228,26 +193,20 @@ abstract class UserManager {
 	}
 
 	/**
-	 * Updates the given user's password
+	 * Updates the given user's password by setting it to the new specified password
 	 *
-	 * @param int $userId
-	 * @param string $newPassword
-	 * @throws UnknownIdException
-	 * @throws AuthError
+	 * @param int $userId the ID of the user whose password should be updated
+	 * @param string $newPassword the new password
+	 * @throws UnknownIdException if no user with the specified ID has been found
+	 * @throws AuthError if an internal problem occurred (do *not* catch)
 	 */
 	protected function updatePasswordInternal($userId, $newPassword) {
-		/*
-		 * Validate before hashing, preserving expected password semantics.
-		 */
-		$newPassword = self::validatePassword($newPassword, true);
-
-		$passwordHash = PasswordHash::from($newPassword);
-		unset($newPassword);
+		$newPassword = PasswordHash::from($newPassword);
 
 		try {
 			$affected = $this->db->update(
 				$this->makeTableNameComponents('users'),
-				[ 'password' => $passwordHash ],
+				[ 'password' => $newPassword ],
 				[ 'id' => $userId ]
 			);
 
@@ -256,45 +215,29 @@ abstract class UserManager {
 			}
 		}
 		catch (Error $e) {
-			/*
-			 * CWE-209:
-			 * Do not disclose database implementation details.
-			 */
-			throw new DatabaseError();
-		}
-		finally {
-			unset($passwordHash);
+			throw new DatabaseError($e->getMessage());
 		}
 	}
 
 	/**
 	 * Called when a user has successfully logged in
 	 *
-	 * @param int $userId
-	 * @param string $email
-	 * @param string $username
-	 * @param int $status
-	 * @param int $roles
-	 * @param int $forceLogout
-	 * @param bool $remembered
-	 * @throws AuthError
+	 * This may happen via the standard login, via the "remember me" feature, or due to impersonation by administrators
+	 *
+	 * @param int $userId the ID of the user
+	 * @param string $email the email address of the user
+	 * @param string $username the display name (if any) of the user
+	 * @param int $status the status of the user as one of the constants from the {@see Status} class
+	 * @param int $roles the roles of the user as a bitmask using constants from the {@see Role} class
+	 * @param int $forceLogout the counter that keeps track of forced logouts that need to be performed in the current session
+	 * @param bool $remembered whether the user has been remembered (instead of them having authenticated actively)
+	 * @throws AuthError if an internal problem occurred (do *not* catch)
 	 */
-	protected function onLoginSuccessful(
-		$userId,
-		$email,
-		$username,
-		$status,
-		$roles,
-		$forceLogout,
-		$remembered
-	) {
-		/*
-		 * CWE-384:
-		 * Regenerate the session identifier after successful authentication.
-		 * The old session identifier must not remain reusable.
-		 */
+	protected function onLoginSuccessful($userId, $email, $username, $status, $roles, $forceLogout, $remembered) {
+		// re-generate the session ID to prevent session fixation attacks (requests a cookie to be written on the client)
 		Session::regenerate(true);
 
+		// save the user data in the session variables maintained by this library
 		$_SESSION[self::SESSION_FIELD_LOGGED_IN] = true;
 		$_SESSION[self::SESSION_FIELD_USER_ID] = (int) $userId;
 		$_SESSION[self::SESSION_FIELD_EMAIL] = $email;
@@ -302,61 +245,57 @@ abstract class UserManager {
 		$_SESSION[self::SESSION_FIELD_STATUS] = (int) $status;
 		$_SESSION[self::SESSION_FIELD_ROLES] = (int) $roles;
 		$_SESSION[self::SESSION_FIELD_FORCE_LOGOUT] = (int) $forceLogout;
-		$_SESSION[self::SESSION_FIELD_REMEMBERED] = (bool) $remembered;
+		$_SESSION[self::SESSION_FIELD_REMEMBERED] = $remembered;
 		$_SESSION[self::SESSION_FIELD_LAST_RESYNC] = \time();
-
 		$_SESSION[self::SESSION_FIELD_AWAITING_2FA_UNTIL] = null;
 		$_SESSION[self::SESSION_FIELD_AWAITING_2FA_USER_ID] = null;
 		$_SESSION[self::SESSION_FIELD_AWAITING_2FA_REMEMBER_DURATION] = null;
 	}
 
 	/**
-	 * Returns requested user data for an account
+	 * Returns the requested user data for the account with the specified username (if any)
 	 *
-	 * @param string $username
-	 * @param array $requestedColumns
-	 * @return array
-	 * @throws UnknownUsernameException
-	 * @throws AmbiguousUsernameException
-	 * @throws AuthError
+	 * You must never pass untrusted input to the parameter that takes the column list
+	 *
+	 * @param string $username the username to look for
+	 * @param array $requestedColumns the columns to request from the user's record
+	 * @return array the user data (if an account was found unambiguously)
+	 * @throws UnknownUsernameException if no user with the specified username has been found
+	 * @throws AmbiguousUsernameException if multiple users with the specified username have been found
+	 * @throws AuthError if an internal problem occurred (do *not* catch)
 	 */
 	protected function getUserDataByUsername($username, array $requestedColumns) {
 		try {
 			$projection = \implode(', ', $requestedColumns);
 
 			$users = $this->db->select(
-				'SELECT ' . $projection
-					. ' FROM ' . $this->makeTableName('users')
-					. ' WHERE username = ? LIMIT 2 OFFSET 0',
+				'SELECT ' . $projection . ' FROM ' . $this->makeTableName('users') . ' WHERE username = ? LIMIT 2 OFFSET 0',
 				[ $username ]
 			);
 		}
 		catch (Error $e) {
-			/*
-			 * CWE-209:
-			 * Database messages can contain SQL, column names, schemas,
-			 * credentials, hostnames and database engine information.
-			 */
-			throw new DatabaseError();
+			throw new DatabaseError($e->getMessage());
 		}
 
 		if (empty($users)) {
 			throw new UnknownUsernameException();
 		}
-
-		if (\count($users) === 1) {
-			return $users[0];
+		else {
+			if (\count($users) === 1) {
+				return $users[0];
+			}
+			else {
+				throw new AmbiguousUsernameException();
+			}
 		}
-
-		throw new AmbiguousUsernameException();
 	}
 
 	/**
 	 * Validates an email address
 	 *
-	 * @param string $email
-	 * @return string
-	 * @throws InvalidEmailException
+	 * @param string $email the email address to validate
+	 * @return string the sanitized email address
+	 * @throws InvalidEmailException if the email address has been invalid
 	 */
 	protected static function validateEmailAddress($email) {
 		if (empty($email)) {
@@ -375,10 +314,10 @@ abstract class UserManager {
 	/**
 	 * Validates a password
 	 *
-	 * @param string $password
-	 * @param bool|null $isNewPassword
-	 * @return string
-	 * @throws InvalidPasswordException
+	 * @param string $password the password to validate
+	 * @param bool|null $isNewPassword (optional) whether the password is a new password that the user wants to use
+	 * @return string the sanitized password
+	 * @throws InvalidPasswordException if the password has been invalid
 	 */
 	protected static function validatePassword($password, $isNewPassword = null) {
 		if (empty($password)) {
@@ -386,17 +325,16 @@ abstract class UserManager {
 		}
 
 		$password = \trim($password);
-
-		$isNewPassword = ($isNewPassword !== null)
-			? (bool) $isNewPassword
-			: false;
+		$isNewPassword = ($isNewPassword !== null) ? (bool) $isNewPassword : false;
 
 		if (\strlen($password) < 1) {
 			throw new InvalidPasswordException();
 		}
 
-		if ($isNewPassword && \strlen($password) > 2048) {
-			throw new InvalidPasswordException();
+		if ($isNewPassword) {
+			if (\strlen($password) > 2048) {
+				throw new InvalidPasswordException();
+			}
 		}
 
 		return $password;
@@ -405,29 +343,23 @@ abstract class UserManager {
 	/**
 	 * Creates a request for email confirmation
 	 *
-	 * @param int $userId
-	 * @param string $email
-	 * @param callable $callback
-	 * @throws AuthError
+	 * The callback function must have the following signature:
+	 *
+	 * `function ($selector, $token)`
+	 *
+	 * Both pieces of information must be sent to the user, usually embedded in a link
+	 *
+	 * When the user wants to verify their email address as a next step, both pieces will be required again
+	 *
+	 * @param int $userId the user's ID
+	 * @param string $email the email address to verify
+	 * @param callable $callback the function that sends the confirmation email to the user
+	 * @throws AuthError if an internal problem occurred (do *not* catch)
 	 */
 	protected function createConfirmationRequest($userId, $email, callable $callback) {
-		/*
-		 * Both values originate exclusively from a CSPRNG.
-		 *
-		 * The selector is intentionally persisted in plaintext because it
-		 * serves only as a lookup identifier.
-		 *
-		 * The authentication token itself is never persisted in plaintext.
-		 */
 		$selector = self::createRandomString(16);
 		$token = self::createRandomString(16);
-
-		/*
-		 * TokenHash::from must use a one-way cryptographic hash suitable
-		 * for authentication tokens.
-		 */
 		$tokenHashed = TokenHash::from($token);
-
 		$expires = \time() + 60 * 60 * 24;
 
 		try {
@@ -443,43 +375,23 @@ abstract class UserManager {
 			);
 		}
 		catch (Error $e) {
-			/*
-			 * CWE-209:
-			 * Do not expose DBMS-generated error text.
-			 */
-			throw new DatabaseError();
+			throw new DatabaseError($e->getMessage());
 		}
 
-		try {
-			if (\is_callable($callback)) {
-				/*
-				 * The plaintext token exists only because it must be delivered
-				 * to the user. It must never be logged or persisted.
-				 */
-				$callback($selector, $token);
-			}
-			else {
-				throw new MissingCallbackError();
-			}
+		if (\is_callable($callback)) {
+			$callback($selector, $token);
 		}
-		finally {
-			/*
-			 * Reduce lifetime of authentication secrets in the scope.
-			 *
-			 * Note: PHP does not provide guaranteed secure memory zeroization
-			 * for normal string variables, therefore this is reference/lifetime
-			 * minimization rather than guaranteed memory erasure.
-			 */
-			unset($token, $tokenHashed, $selector);
+		else {
+			throw new MissingCallbackError();
 		}
 	}
 
 	/**
-	 * Clears an existing "remember me" directive
+	 * Clears an existing directive that keeps the user logged in ("remember me")
 	 *
-	 * @param int $userId
-	 * @param string $selector
-	 * @throws AuthError
+	 * @param int $userId the ID of the user who shouldn't be kept signed in anymore
+	 * @param string $selector (optional) the selector which the deletion should be restricted to
+	 * @throws AuthError if an internal problem occurred (do *not* catch)
 	 */
 	protected function deleteRememberDirectiveForUserById($userId, $selector = null) {
 		$whereMappings = [];
@@ -497,36 +409,31 @@ abstract class UserManager {
 			);
 		}
 		catch (Error $e) {
-			throw new DatabaseError();
+			throw new DatabaseError($e->getMessage());
 		}
 	}
 
 	/**
-	 * Triggers a forced logout for all user sessions
+	 * Triggers a forced logout in all sessions that belong to the specified user
 	 *
-	 * @param int $userId
-	 * @throws AuthError
+	 * @param int $userId the ID of the user to sign out
+	 * @throws AuthError if an internal problem occurred (do *not* catch)
 	 */
 	protected function forceLogoutForUserById($userId) {
 		$this->deleteRememberDirectiveForUserById($userId);
-
-		try {
-			$this->db->exec(
-				'UPDATE ' . $this->makeTableName('users')
-					. ' SET force_logout = force_logout + 1 WHERE id = ?',
-				[ $userId ]
-			);
-		}
-		catch (Error $e) {
-			throw new DatabaseError();
-		}
+		$this->db->exec(
+			'UPDATE ' . $this->makeTableName('users') . ' SET force_logout = force_logout + 1 WHERE id = ?',
+			[ $userId ]
+		);
 	}
 
 	/**
-	 * Builds table name components
+	 * Builds a (qualified) full table name from an optional qualifier, an optional prefix, and the table name itself
 	 *
-	 * @param string $name
-	 * @return string[]
+	 * The optional qualifier may be a database name or a schema name, for example
+	 *
+	 * @param string $name the name of the table
+	 * @return string[] the components of the (qualified) full name of the table
 	 */
 	protected function makeTableNameComponents($name) {
 		$components = [];
@@ -548,10 +455,12 @@ abstract class UserManager {
 	}
 
 	/**
-	 * Builds full qualified table name
+	 * Builds a (qualified) full table name from an optional qualifier, an optional prefix, and the table name itself
 	 *
-	 * @param string $name
-	 * @return string
+	 * The optional qualifier may be a database name or a schema name, for example
+	 *
+	 * @param string $name the name of the table
+	 * @return string the (qualified) full name of the table
 	 */
 	protected function makeTableName($name) {
 		$components = $this->makeTableNameComponents($name);
@@ -560,4 +469,3 @@ abstract class UserManager {
 	}
 
 }
-```
