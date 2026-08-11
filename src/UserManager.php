@@ -9,11 +9,6 @@ use Delight\Db\PdoDsn;
 use Delight\Db\Throwable\Error;
 use Delight\Db\Throwable\IntegrityConstraintViolationException;
 
-/**
- * Abstract base class for components implementing user management
- *
- * @internal
- */
 abstract class UserManager {
 
     // Session fields
@@ -40,9 +35,7 @@ abstract class UserManager {
     protected $dbTablePrefix;
 
     /**
-     * @param PdoDatabase|PdoDsn|\PDO $databaseConnection
-     * @param string|null $dbTablePrefix
-     * @param string|null $dbSchema
+     * Constructor
      */
     protected function __construct($databaseConnection, $dbTablePrefix = null, $dbSchema = null) {
         $this->db = $this->initializeDatabase($databaseConnection);
@@ -70,7 +63,7 @@ abstract class UserManager {
     }
 
     /**
-     * Creates a random string with the given maximum length
+     * Creates a random string
      */
     public static function createRandomString($maxLength = 24) {
         $bytes = floor((int) $maxLength / 4) * 3;
@@ -95,7 +88,7 @@ abstract class UserManager {
         $passwordHash = PasswordHash::from($password);
         $isVerified = is_callable($callback) ? 0 : 1;
 
-        $newUserId = $this->insertNewUser($email, $passwordHash, $username, $isVerified);
+        $newUserId = $this->insertUser($email, $passwordHash, $username, $isVerified);
 
         if ($isVerified === 0) {
             $this->createConfirmationRequest($newUserId, $email, $callback);
@@ -104,6 +97,9 @@ abstract class UserManager {
         return $newUserId;
     }
 
+    /**
+     * Sanitizes username
+     */
     private function sanitizeUsername($username) {
         if (!isset($username)) {
             return null;
@@ -113,6 +109,9 @@ abstract class UserManager {
         return $username === '' ? null : $username;
     }
 
+    /**
+     * Ensures username uniqueness
+     */
     private function ensureUsernameIsUnique($username) {
         $count = $this->db->selectValue(
             'SELECT COUNT(*) FROM ' . $this->makeTableName('users') . ' WHERE username = ?',
@@ -124,7 +123,10 @@ abstract class UserManager {
         }
     }
 
-    private function insertNewUser($email, $passwordHash, $username, $verified) {
+    /**
+     * Inserts user into database
+     */
+    private function insertUser($email, $passwordHash, $username, $verified) {
         try {
             $this->db->insert(
                 $this->makeTableNameComponents('users'),
@@ -148,7 +150,7 @@ abstract class UserManager {
     }
 
     /**
-     * Updates the given user's password
+     * Updates user password
      */
     protected function updatePasswordInternal($userId, $newPassword) {
         $newPasswordHash = PasswordHash::from($newPassword);
@@ -170,7 +172,7 @@ abstract class UserManager {
     }
 
     /**
-     * Called when a user has successfully logged in
+     * Handles successful login
      */
     protected function onLoginSuccessful($userId, $email, $username, $status, $roles, $forceLogout, $remembered) {
         Session::regenerate(true);
@@ -184,13 +186,14 @@ abstract class UserManager {
         $_SESSION[self::SESSION_FIELD_FORCE_LOGOUT] = (int) $forceLogout;
         $_SESSION[self::SESSION_FIELD_REMEMBERED] = $remembered;
         $_SESSION[self::SESSION_FIELD_LAST_RESYNC] = time();
+
         $_SESSION[self::SESSION_FIELD_AWAITING_2FA_UNTIL] = null;
         $_SESSION[self::SESSION_FIELD_AWAITING_2FA_USER_ID] = null;
         $_SESSION[self::SESSION_FIELD_AWAITING_2FA_REMEMBER_DURATION] = null;
     }
 
     /**
-     * Returns user data by username
+     * Gets user data by username
      */
     protected function getUserDataByUsername($username, array $requestedColumns) {
         $projection = implode(', ', $requestedColumns);
@@ -217,7 +220,7 @@ abstract class UserManager {
     }
 
     /**
-     * Validates an email address
+     * Validates email
      */
     protected static function validateEmailAddress($email) {
         if (empty($email)) {
@@ -234,7 +237,7 @@ abstract class UserManager {
     }
 
     /**
-     * Validates a password
+     * Validates password
      */
     protected static function validatePassword($password, $isNewPassword = null) {
         if (empty($password)) {
@@ -256,7 +259,7 @@ abstract class UserManager {
     }
 
     /**
-     * Creates a request for email confirmation
+     * Creates email confirmation request
      */
     protected function createConfirmationRequest($userId, $email, callable $callback) {
         $selector = self::createRandomString(16);
@@ -288,7 +291,7 @@ abstract class UserManager {
     }
 
     /**
-     * Clears "remember me" directive
+     * Deletes remember-me directive
      */
     protected function deleteRememberDirectiveForUserById($userId, $selector = null) {
         $where = ['user' => (int) $userId];
@@ -309,7 +312,7 @@ abstract class UserManager {
     }
 
     /**
-     * Forces logout for all sessions of a user
+     * Forces logout for user
      */
     protected function forceLogoutForUserById($userId) {
         $this->deleteRememberDirectiveForUserById($userId);
